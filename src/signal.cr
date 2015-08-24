@@ -80,27 +80,73 @@ else
 end
 
 enum Signal
+
+  @@initialized = false
+
+  protected def self.init
+    unless @@initialized
+      @@signal_queue = [] of {Fiber, Int32}
+      @@handlers = {} of Int32 => Int32 ->
+      @@signal_channel = Channel(Int32).new
+
+      @@signal_fiber = Fiber.new do
+        # This fiber is just so we can do stuff without breaking the scheduler
+        loop do
+          until @@signal_queue.not_nil!.empty?
+            sig = @@signal_queue.not_nil!.pop
+            Scheduler.enqueue Fiber.current
+            sig[0].resume # Lets make sure the signal handler exits cleanly before any further stuff
+
+            # If there really is another signal to be handled this function will return before the first signal has been processed.
+            # However that does not matter as it will simply handle the new signal and after that it'll continue handling the old one
+            @@signal_channel.not_nil!.send sig[1]
+          end
+          Scheduler.reschedule
+        end
+      end
+
+      spawn do
+        # This is the fiber the actual handlers will run in
+        while signum = @@signal_channel.not_nil!.receive
+          @@handlers.not_nil![signum]?.try &.call(signum)
+        end
+      end
+    end
+  end
+
   def trap(block : Int32 ->)
     trap &block
   end
 
   def trap(&block : Int32 ->)
+    Signal.init
+    trap_raw do |signum|
+      @@signal_queue.not_nil! << {Fiber.current, signum}
+      @@signal_fiber.not_nil!.resume
+    end
+  end
+
+  def trap_raw(&block : Int32 ->)
     if block.closure?
-      handlers = @@handlers ||= {} of Int32 => Int32 ->
+      handlers = @@raw_handlers ||= {} of Int32 => Int32 ->
       handlers[value] = block
       LibC.signal value, ->(num) do
-        @@handlers.not_nil![num]?.try &.call(num)
+        @@raw_handlers.not_nil![num]?.try &.call(num)
       end
     else
       LibC.signal value, block
     end
   end
 
+  def trap_raw(block : Int32 ->)
+    trap &block
+  end
+
   def reset
-    trap Proc(Int32, Void).new(Pointer(Void).new(0_u64), Pointer(Void).null)
+    trap_raw Proc(Int32, Void).new(Pointer(Void).new(0_u64), Pointer(Void).null)
   end
 
   def ignore
-    trap Proc(Int32, Void).new(Pointer(Void).new(1_u64), Pointer(Void).null)
+    trap_raw Proc(Int32, Void).new(Pointer(Void).new(1_u64), Pointer(Void).null)
   end
 end
